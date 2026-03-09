@@ -359,7 +359,7 @@ async function callOllamaChat({ capability, model, messages, prompt, images, log
   }
 
   return {
-    content,
+    content: stripThinkTags(content),
     usage: buildOllamaUsage(data),
   };
 }
@@ -402,6 +402,12 @@ function stripDataUrlPrefix(value) {
   const marker = 'base64,';
   const index = stringValue.indexOf(marker);
   return index >= 0 ? stringValue.slice(index + marker.length) : stringValue;
+}
+
+function stripThinkTags(content) {
+  return String(content || '')
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .trim();
 }
 
 function buildOllamaUsage(data) {
@@ -820,7 +826,7 @@ async function handleTaskLookup(request, runtime, requestId, taskId) {
 async function fetchOllamaModels(runtime) {
   const endpoint = `${runtime.ollamaBaseUrl}/api/tags`;
   const response = await fetchWithTimeout(endpoint, { method: 'GET' }, runtime.upstreamTimeoutMs);
-  const data = await parseJsonSafe(response);
+  const data = await safeReadJson(response);
 
   if (!response.ok) {
     throw new HttpError(502, 'upstream_error', `Ollama model list error (${response.status}): ${JSON.stringify(data)}`);
