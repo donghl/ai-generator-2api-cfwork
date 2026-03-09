@@ -817,17 +817,56 @@ async function handleTaskLookup(request, runtime, requestId, taskId) {
   }
 }
 
-function handleModelsRequest(runtime, requestId) {
-  const textModels = runtime.textModelAllowlist.length > 0
+async function fetchOllamaModels(runtime) {
+  const endpoint = `${runtime.ollamaBaseUrl}/api/tags`;
+  const response = await fetchWithTimeout(endpoint, { method: 'GET' }, runtime.upstreamTimeoutMs);
+  const data = await parseJsonSafe(response);
+
+  if (!response.ok) {
+    throw new HttpError(502, 'upstream_error', `Ollama model list error (${response.status}): ${JSON.stringify(data)}`);
+  }
+
+  if (!Array.isArray(data?.models)) {
+    return [];
+  }
+
+  return data.models
+    .map((item) => String(item?.name || item?.model || '').trim())
+    .filter(Boolean);
+}
+
+async function handleModelsRequest(runtime, requestId) {
+  let textModels = runtime.textModelAllowlist.length > 0
     ? runtime.textModelAllowlist
     : runtime.defaultTextModel ? [runtime.defaultTextModel] : [];
-  const visionModels = runtime.visionModelAllowlist.length > 0
+  let visionModels = runtime.visionModelAllowlist.length > 0
     ? runtime.visionModelAllowlist
     : runtime.defaultVisionModel ? [runtime.defaultVisionModel] : [];
 
+  if (textModels.length === 0 && visionModels.length === 0) {
+    const discovered = await fetchOllamaModels(runtime);
+    textModels = discovered;
+    visionModels = discovered;
+  }
+
+  const seen = new Set();
   const models = [
-    ...textModels.map((id) => ({ id, object: 'model', created: Date.now(), owned_by: 'ollama', capability: 'text' })),
-    ...visionModels.map((id) => ({ id, object: 'model', created: Date.now(), owned_by: 'ollama', capability: 'vision' })),
+    ...textModels
+      .filter((id) => {
+        const key = `text:${id}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .map((id) => ({ id, object: 'model', created: Date.now(), owned_by: 'ollama', capability: 'text' })),
+    ...visionModels
+      .filter((id) => {
+        const key = `vision:${id}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .map((id) => ({ id, object: 'model', created: Date.now(), owned_by: 'ollama', capability: 'vision' })),
     { id: 'comfyui-image', object: 'model', created: Date.now(), owned_by: 'comfyui', capability: 'image' },
     { id: 'comfyui-video', object: 'model', created: Date.now(), owned_by: 'comfyui', capability: 'video' },
   ];
