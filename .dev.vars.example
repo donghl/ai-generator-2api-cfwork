@@ -1,0 +1,12 @@
+# Required
+API_MASTER_KEY=replace-with-a-strong-secret
+
+# Optional
+PROJECT_NAME=ai-generator-openai-gateway
+PROJECT_VERSION=3.0.0
+UPSTREAM_ORIGIN=https://ai-image-generator.co
+DEFAULT_MODEL=flux-schnell
+ALLOWED_MODELS=flux-schnell
+ENABLE_WEB_UI=true
+UPSTREAM_TIMEOUT_MS=45000
+CORS_ALLOW_ORIGIN=*
