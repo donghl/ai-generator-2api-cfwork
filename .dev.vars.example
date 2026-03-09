@@ -1,12 +1,26 @@
 # Required
 API_MASTER_KEY=replace-with-a-strong-secret
 
-# Optional
+# Core runtime
 PROJECT_NAME=ai-generator-openai-gateway
-PROJECT_VERSION=3.0.0
-UPSTREAM_ORIGIN=https://ai-image-generator.co
-DEFAULT_MODEL=flux-schnell
-ALLOWED_MODELS=flux-schnell
+PROJECT_VERSION=3.1.0
 ENABLE_WEB_UI=true
-UPSTREAM_TIMEOUT_MS=45000
+UPSTREAM_TIMEOUT_MS=60000
 CORS_ALLOW_ORIGIN=*
+
+# Backend routing
+OLLAMA_BASE_URL=https://honglei.synology.me:11434
+COMFYUI_BASE_URL=https://honglei.synology.me:8188
+
+# Model routing (request-time selection is allowed; allowlists optional)
+DEFAULT_TEXT_MODEL=
+DEFAULT_VISION_MODEL=
+TEXT_MODEL_ALLOWLIST=
+VISION_MODEL_ALLOWLIST=
+
+# ComfyUI workflow templates (JSON string with placeholders like {{prompt}} {{aspect_ratio}})
+IMAGE_WORKFLOW_JSON=
+VIDEO_WORKFLOW_JSON=
+
+# Task storage
+TASKS_KV_PREFIX=task

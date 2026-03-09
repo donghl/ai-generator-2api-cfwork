@@ -1,22 +1,29 @@
 // =================================================================================
 //  项目: ai-generator-2api (Cloudflare Worker 单文件版)
-//  版本: 3.0.0 (Gateway Hardening Edition)
-//  目标: 作为面向 App / 第三方客户端的最小 OpenAI 兼容图片网关
+//  版本: 3.1.0
+//  目标: 面向 App / 第三方客户端的最小 OpenAI 兼容 AI 网关
+//  能力: text -> Ollama, vision -> Ollama, image -> ComfyUI, video -> ComfyUI
 // =================================================================================
 
 const CONFIG = {
   PROJECT_NAME: 'ai-generator-openai-gateway',
-  PROJECT_VERSION: '3.0.0',
-  UPSTREAM_ORIGIN: 'https://ai-image-generator.co',
-  DEFAULT_MODEL: 'flux-schnell',
-  ALLOWED_MODELS: ['flux-schnell'],
+  PROJECT_VERSION: '3.1.0',
   ENABLE_WEB_UI: false,
-  UPSTREAM_TIMEOUT_MS: 45000,
+  UPSTREAM_TIMEOUT_MS: 60000,
   CORS_ALLOW_ORIGIN: '*',
+  OLLAMA_BASE_URL: 'https://honglei.synology.me:11434',
+  COMFYUI_BASE_URL: 'https://honglei.synology.me:8188',
+  DEFAULT_TEXT_MODEL: '',
+  DEFAULT_VISION_MODEL: '',
+  TEXT_MODEL_ALLOWLIST: [],
+  VISION_MODEL_ALLOWLIST: [],
+  IMAGE_WORKFLOW_JSON: '',
+  VIDEO_WORKFLOW_JSON: '',
+  TASKS_KV_PREFIX: 'task',
 };
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const runtime = getRuntimeConfig(env);
     const requestId = crypto.randomUUID();
     const url = new URL(request.url);
@@ -38,13 +45,7 @@ export default {
 
       if (url.pathname === '/') {
         if (!runtime.enableWebUi) {
-          return createErrorResponse(
-            'Web UI is disabled',
-            404,
-            'not_found',
-            runtime,
-            requestId,
-          );
+          return createErrorResponse('Web UI is disabled', 404, 'not_found', runtime, requestId);
         }
         return handleUI(request, runtime, requestId);
       }
@@ -56,6 +57,7 @@ export default {
             project: runtime.projectName,
             version: runtime.projectVersion,
             request_id: requestId,
+            capabilities: ['text', 'vision', 'image', 'video'],
           },
           200,
           runtime,
@@ -73,6 +75,15 @@ export default {
 
       if (url.pathname === '/v1/images/generations') {
         return handleImageGenerations(request, runtime, requestId);
+      }
+
+      if (url.pathname === '/v1/videos/generations') {
+        return handleVideoGenerations(request, runtime, requestId);
+      }
+
+      if (url.pathname.startsWith('/v1/tasks/')) {
+        const taskId = decodeURIComponent(url.pathname.replace('/v1/tasks/', ''));
+        return handleTaskLookup(request, runtime, requestId, taskId);
       }
 
       return createErrorResponse(
@@ -112,29 +123,43 @@ class Logger {
   }
 }
 
-function getRuntimeConfig(env = {}) {
-  const allowedModels = parseCsv(env.ALLOWED_MODELS) || CONFIG.ALLOWED_MODELS;
-  const defaultModel = env.DEFAULT_MODEL || CONFIG.DEFAULT_MODEL;
+class HttpError extends Error {
+  constructor(status, code, message) {
+    super(message);
+    this.name = 'HttpError';
+    this.status = status;
+    this.code = code;
+  }
+}
 
+function getRuntimeConfig(env = {}) {
   return {
     projectName: env.PROJECT_NAME || CONFIG.PROJECT_NAME,
     projectVersion: env.PROJECT_VERSION || CONFIG.PROJECT_VERSION,
     apiMasterKey: env.API_MASTER_KEY || '',
-    upstreamOrigin: (env.UPSTREAM_ORIGIN || CONFIG.UPSTREAM_ORIGIN).replace(/\/$/, ''),
-    defaultModel,
-    allowedModels: allowedModels.length > 0 ? allowedModels : [defaultModel],
     enableWebUi: parseBoolean(env.ENABLE_WEB_UI, CONFIG.ENABLE_WEB_UI),
     upstreamTimeoutMs: parsePositiveInt(env.UPSTREAM_TIMEOUT_MS, CONFIG.UPSTREAM_TIMEOUT_MS),
     corsAllowOrigin: env.CORS_ALLOW_ORIGIN || CONFIG.CORS_ALLOW_ORIGIN,
+    ollamaBaseUrl: normalizeBaseUrl(env.OLLAMA_BASE_URL || CONFIG.OLLAMA_BASE_URL),
+    comfyuiBaseUrl: normalizeBaseUrl(env.COMFYUI_BASE_URL || CONFIG.COMFYUI_BASE_URL),
+    defaultTextModel: env.DEFAULT_TEXT_MODEL || CONFIG.DEFAULT_TEXT_MODEL,
+    defaultVisionModel: env.DEFAULT_VISION_MODEL || CONFIG.DEFAULT_VISION_MODEL,
+    textModelAllowlist: parseCsv(env.TEXT_MODEL_ALLOWLIST),
+    visionModelAllowlist: parseCsv(env.VISION_MODEL_ALLOWLIST),
+    imageWorkflow: parseJsonObject(env.IMAGE_WORKFLOW_JSON || CONFIG.IMAGE_WORKFLOW_JSON),
+    videoWorkflow: parseJsonObject(env.VIDEO_WORKFLOW_JSON || CONFIG.VIDEO_WORKFLOW_JSON),
+    tasksKvPrefix: env.TASKS_KV_PREFIX || CONFIG.TASKS_KV_PREFIX,
+    taskStore: env.TASKS,
   };
+}
+
+function normalizeBaseUrl(url) {
+  return String(url || '').replace(/\/$/, '');
 }
 
 function parseCsv(value) {
   if (!value || typeof value !== 'string') return [];
-  return value
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
+  return value.split(',').map((item) => item.trim()).filter(Boolean);
 }
 
 function parseBoolean(value, fallback = false) {
@@ -144,48 +169,29 @@ function parseBoolean(value, fallback = false) {
 }
 
 function parsePositiveInt(value, fallback) {
-  const parsed = Number.parseInt(value, 10);
+  const parsed = Number.parseInt(String(value), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function generateFingerprint() {
-  const chars = '0123456789abcdef';
-  let result = '';
-  for (let i = 0; i < 32; i += 1) {
-    result += chars[Math.floor(Math.random() * 16)];
+function parseJsonObject(value) {
+  if (!value) return null;
+  try {
+    const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
   }
-  return result;
-}
-
-function generateRandomIP() {
-  return `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
-}
-
-function getFakeHeaders(runtime, fingerprint, anonUserId) {
-  const fakeIP = generateRandomIP();
-  return {
-    headers: {
-      accept: '*/*',
-      'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-      'content-type': 'application/json',
-      origin: runtime.upstreamOrigin,
-      referer: `${runtime.upstreamOrigin}/`,
-      'user-agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
-      'X-Forwarded-For': fakeIP,
-      'X-Real-IP': fakeIP,
-      'CF-Connecting-IP': fakeIP,
-      'True-Client-IP': fakeIP,
-      'X-Client-IP': fakeIP,
-      Cookie: `anon_user_id=${anonUserId};`,
-    },
-    fakeIP,
-  };
 }
 
 function verifyAuth(request, validKey) {
   const auth = request.headers.get('Authorization') || '';
   return auth === `Bearer ${validKey}`;
+}
+
+function ensureAuthorized(request, runtime) {
+  if (!verifyAuth(request, runtime.apiMasterKey)) {
+    throw new HttpError(401, 'unauthorized', 'Unauthorized');
+  }
 }
 
 async function requireJsonBody(request) {
@@ -201,34 +207,26 @@ async function requireJsonBody(request) {
   }
 }
 
-function ensureAuthorized(request, runtime) {
-  if (!verifyAuth(request, runtime.apiMasterKey)) {
-    throw new HttpError(401, 'unauthorized', 'Unauthorized');
+function requirePrompt(value) {
+  const prompt = String(value || '').trim();
+  if (!prompt) {
+    throw new HttpError(400, 'invalid_request', 'Prompt is required');
   }
+  return prompt;
 }
 
-function ensureAllowedModel(requestedModel, runtime) {
-  const model = requestedModel || runtime.defaultModel;
-  if (!runtime.allowedModels.includes(model)) {
-    throw new HttpError(
-      400,
-      'model_not_allowed',
-      `Model not allowed: ${model}`,
-    );
+function inferCapabilityFromMessages(messages) {
+  for (const message of messages || []) {
+    const content = message?.content;
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part?.type === 'image_url' || part?.type === 'input_image') {
+          return 'vision';
+        }
+      }
+    }
   }
-  return model;
-}
-
-function normalizeAspectRatioFromSize(size) {
-  switch (size) {
-    case '1024x1792':
-      return '9:16';
-    case '1792x1024':
-      return '16:9';
-    case '1024x1024':
-    default:
-      return '1:1';
-  }
+  return 'text';
 }
 
 function extractPromptFromMessages(messages) {
@@ -236,25 +234,66 @@ function extractPromptFromMessages(messages) {
     throw new HttpError(400, 'invalid_request', 'No messages found');
   }
 
-  const lastMsg = messages[messages.length - 1];
-  let prompt = '';
-
-  if (typeof lastMsg?.content === 'string') {
-    prompt = lastMsg.content;
-  } else if (Array.isArray(lastMsg?.content)) {
-    for (const part of lastMsg.content) {
-      if (part?.type === 'text' && typeof part.text === 'string') {
-        prompt += `${part.text} `;
+  const textParts = [];
+  for (const message of messages) {
+    const content = message?.content;
+    if (typeof content === 'string') {
+      textParts.push(`${message.role || 'user'}: ${content}`);
+      continue;
+    }
+    if (Array.isArray(content)) {
+      const collected = [];
+      for (const part of content) {
+        if (part?.type === 'text' && typeof part.text === 'string') {
+          collected.push(part.text.trim());
+        }
+      }
+      if (collected.length > 0) {
+        textParts.push(`${message.role || 'user'}: ${collected.join(' ')}`);
       }
     }
   }
 
-  prompt = prompt.trim();
+  const prompt = textParts.join('\n').trim();
   if (!prompt) {
     throw new HttpError(400, 'invalid_request', 'Prompt is empty');
   }
-
   return prompt;
+}
+
+function extractImagesFromMessages(messages) {
+  const images = [];
+  for (const message of messages || []) {
+    const content = message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (part?.type === 'image_url') {
+        const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+        if (url) images.push(url);
+      }
+      if (part?.type === 'input_image') {
+        const url = part.image_url || part.url;
+        if (url) images.push(url);
+      }
+    }
+  }
+  return images;
+}
+
+function selectModel(capability, requestedModel, runtime) {
+  const allowlist = capability === 'vision' ? runtime.visionModelAllowlist : runtime.textModelAllowlist;
+  const fallback = capability === 'vision' ? runtime.defaultVisionModel : runtime.defaultTextModel;
+  const model = requestedModel || fallback;
+
+  if (!model) {
+    throw new HttpError(400, 'missing_model', `Missing model for capability: ${capability}`);
+  }
+
+  if (allowlist.length > 0 && !allowlist.includes(model)) {
+    throw new HttpError(400, 'model_not_allowed', `Model not allowed for ${capability}: ${model}`);
+  }
+
+  return model;
 }
 
 async function fetchWithTimeout(url, init, timeoutMs) {
@@ -273,113 +312,281 @@ async function fetchWithTimeout(url, init, timeoutMs) {
   }
 }
 
-async function performUpstreamGeneration(prompt, model, aspectRatio, logger, runtime) {
-  const fingerprint = generateFingerprint();
-  const anonUserId = crypto.randomUUID();
-  const { headers, fakeIP } = getFakeHeaders(runtime, fingerprint, anonUserId);
+async function callOllamaChat({ capability, model, messages, prompt, images, logger, runtime }) {
+  const endpoint = `${runtime.ollamaBaseUrl}/api/chat`;
+  const ollamaMessages = Array.isArray(messages) && messages.length > 0
+    ? messages.map((message) => normalizeOllamaMessage(message))
+    : [{ role: 'user', content: prompt, ...(images?.length ? { images } : {}) }];
 
-  logger.add('Identity Created', {
-    fingerprint,
-    anonUserId,
-    fakeIP,
-    userAgent: headers['user-agent'],
-  });
-
-  const deductPayload = {
-    trans_type: 'image_generation',
-    credits: 1,
-    model,
-    numOutputs: 1,
-    fingerprint_id: fingerprint,
-  };
-
-  try {
-    logger.add('Step 1: Deduct Request', deductPayload);
-    const deductRes = await fetchWithTimeout(
-      `${runtime.upstreamOrigin}/api/credits/deduct`,
-      {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(deductPayload),
-      },
-      runtime.upstreamTimeoutMs,
-    );
-
-    const deductText = await deductRes.text();
-    let deductJson;
-    try {
-      deductJson = JSON.parse(deductText);
-    } catch {
-      deductJson = deductText;
+  if (capability === 'vision' && images?.length) {
+    const lastUserIndex = [...ollamaMessages].reverse().findIndex((message) => message.role === 'user');
+    if (lastUserIndex !== -1) {
+      const idx = ollamaMessages.length - 1 - lastUserIndex;
+      ollamaMessages[idx] = {
+        ...ollamaMessages[idx],
+        images,
+      };
     }
-
-    logger.add('Step 1: Deduct Response', {
-      status: deductRes.status,
-      body: deductJson,
-    });
-  } catch (error) {
-    logger.add('Deduct Error', error?.message || String(error));
   }
 
-  const formData = new FormData();
-  formData.append('prompt', prompt);
-  formData.append('model', model);
-  formData.append('num_outputs', '1');
-  formData.append('inputMode', 'text');
-  formData.append('style', 'auto');
-  formData.append('aspectRatio', aspectRatio || '1:1');
-  formData.append('fingerprint_id', fingerprint);
-  formData.append('provider', 'replicate');
-
-  const genHeaders = { ...headers };
-  delete genHeaders['content-type'];
-
-  logger.add('Step 2: Generation Request', {
-    url: `${runtime.upstreamOrigin}/api/gen-image`,
-    provider: 'replicate',
-    prompt,
-    aspectRatio,
+  const payload = {
     model,
-  });
+    messages: ollamaMessages,
+    stream: false,
+  };
 
+  logger.add('Ollama Request', { endpoint, capability, model, payload });
   const response = await fetchWithTimeout(
-    `${runtime.upstreamOrigin}/api/gen-image`,
+    endpoint,
     {
       method: 'POST',
-      headers: genHeaders,
-      body: formData,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
     },
     runtime.upstreamTimeoutMs,
   );
 
-  const respText = await response.text();
-  let data;
-  try {
-    data = JSON.parse(respText);
-  } catch {
-    logger.add('Upstream Parse Error', respText);
-    throw new HttpError(
-      502,
-      'upstream_invalid_response',
-      `Upstream returned non-JSON: ${respText.substring(0, 200)}`,
-    );
-  }
-
-  logger.add('Step 2: Upstream Response (Full)', data);
+  const data = await safeReadJson(response);
+  logger.add('Ollama Response', { status: response.status, data });
 
   if (!response.ok) {
-    throw new HttpError(
-      502,
-      'upstream_error',
-      `Upstream Error (${response.status}): ${JSON.stringify(data)}`,
+    throw new HttpError(502, 'upstream_error', `Ollama error (${response.status}): ${JSON.stringify(data)}`);
+  }
+
+  const content = data?.message?.content;
+  if (!content) {
+    throw new HttpError(502, 'upstream_invalid_response', 'Ollama response missing message.content');
+  }
+
+  return {
+    content,
+    usage: buildOllamaUsage(data),
+  };
+}
+
+function normalizeOllamaMessage(message) {
+  const role = message?.role || 'user';
+  const content = message?.content;
+
+  if (typeof content === 'string') {
+    return { role, content };
+  }
+
+  if (Array.isArray(content)) {
+    const text = [];
+    const images = [];
+    for (const part of content) {
+      if (part?.type === 'text' && typeof part.text === 'string') {
+        text.push(part.text);
+      }
+      if (part?.type === 'image_url') {
+        const imageUrl = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+        if (imageUrl) images.push(stripDataUrlPrefix(imageUrl));
+      }
+      if (part?.type === 'input_image') {
+        const imageUrl = part.image_url || part.url;
+        if (imageUrl) images.push(stripDataUrlPrefix(imageUrl));
+      }
+    }
+
+    const normalized = { role, content: text.join('\n').trim() };
+    if (images.length > 0) normalized.images = images;
+    return normalized;
+  }
+
+  return { role, content: '' };
+}
+
+function stripDataUrlPrefix(value) {
+  const stringValue = String(value || '');
+  const marker = 'base64,';
+  const index = stringValue.indexOf(marker);
+  return index >= 0 ? stringValue.slice(index + marker.length) : stringValue;
+}
+
+function buildOllamaUsage(data) {
+  const promptTokens = data?.prompt_eval_count || 0;
+  const completionTokens = data?.eval_count || 0;
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+  };
+}
+
+async function safeReadJson(response) {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
+}
+
+function normalizeAspectRatioFromSize(size) {
+  switch (size) {
+    case '1024x1792':
+      return '9:16';
+    case '1792x1024':
+      return '16:9';
+    case '1024x1024':
+    default:
+      return '1:1';
+  }
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function applyWorkflowPlaceholders(nodeValue, replacements) {
+  if (typeof nodeValue === 'string') {
+    let result = nodeValue;
+    for (const [key, replacement] of Object.entries(replacements)) {
+      result = result.replaceAll(`{{${key}}}`, replacement == null ? '' : String(replacement));
+    }
+    return result;
+  }
+
+  if (Array.isArray(nodeValue)) {
+    return nodeValue.map((item) => applyWorkflowPlaceholders(item, replacements));
+  }
+
+  if (nodeValue && typeof nodeValue === 'object') {
+    return Object.fromEntries(
+      Object.entries(nodeValue).map(([key, value]) => [key, applyWorkflowPlaceholders(value, replacements)]),
     );
   }
 
-  if (data?.code === 0 && Array.isArray(data.data) && data.data[0]?.url) {
-    return data.data[0].url;
+  return nodeValue;
+}
+
+function buildComfyWorkflow(kind, runtime, params) {
+  const template = kind === 'video' ? runtime.videoWorkflow : runtime.imageWorkflow;
+  if (!template) {
+    throw new HttpError(
+      500,
+      'workflow_not_configured',
+      `${kind} workflow is not configured. Set ${kind === 'video' ? 'VIDEO_WORKFLOW_JSON' : 'IMAGE_WORKFLOW_JSON'}.`,
+    );
   }
 
-  throw new HttpError(502, 'upstream_error', data?.message || 'Unknown upstream error');
+  return applyWorkflowPlaceholders(cloneJson(template), params);
+}
+
+async function submitComfyWorkflow(kind, workflow, logger, runtime) {
+  const clientId = crypto.randomUUID();
+  const endpoint = `${runtime.comfyuiBaseUrl}/prompt`;
+  const payload = {
+    client_id: clientId,
+    prompt: workflow,
+  };
+
+  logger.add('ComfyUI Submit Request', { kind, endpoint, payload });
+  const response = await fetchWithTimeout(
+    endpoint,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    runtime.upstreamTimeoutMs,
+  );
+  const data = await safeReadJson(response);
+  logger.add('ComfyUI Submit Response', { status: response.status, data });
+
+  if (!response.ok || !data?.prompt_id) {
+    throw new HttpError(502, 'upstream_error', `ComfyUI submit failed: ${JSON.stringify(data)}`);
+  }
+
+  return {
+    clientId,
+    promptId: data.prompt_id,
+    number: data.number,
+  };
+}
+
+async function fetchComfyHistory(promptId, logger, runtime) {
+  const endpoint = `${runtime.comfyuiBaseUrl}/history/${encodeURIComponent(promptId)}`;
+  logger.add('ComfyUI History Request', { endpoint, promptId });
+  const response = await fetchWithTimeout(endpoint, { method: 'GET' }, runtime.upstreamTimeoutMs);
+  const data = await safeReadJson(response);
+  logger.add('ComfyUI History Response', { status: response.status, data });
+
+  if (!response.ok) {
+    throw new HttpError(502, 'upstream_error', `ComfyUI history failed: ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+function extractComfyOutputs(historyData, promptId, runtime) {
+  const item = historyData?.[promptId];
+  const outputs = [];
+  if (!item?.outputs || typeof item.outputs !== 'object') {
+    return outputs;
+  }
+
+  for (const nodeOutput of Object.values(item.outputs)) {
+    if (Array.isArray(nodeOutput?.images)) {
+      for (const image of nodeOutput.images) {
+        if (!image?.filename) continue;
+        const params = new URLSearchParams({
+          filename: image.filename,
+          subfolder: image.subfolder || '',
+          type: image.type || 'output',
+        });
+        outputs.push({
+          type: 'image',
+          url: `${runtime.comfyuiBaseUrl}/view?${params.toString()}`,
+          filename: image.filename,
+          subfolder: image.subfolder || '',
+        });
+      }
+    }
+
+    if (Array.isArray(nodeOutput?.gifs)) {
+      for (const gif of nodeOutput.gifs) {
+        if (!gif?.filename) continue;
+        const params = new URLSearchParams({
+          filename: gif.filename,
+          subfolder: gif.subfolder || '',
+          type: gif.type || 'output',
+        });
+        outputs.push({
+          type: 'video',
+          url: `${runtime.comfyuiBaseUrl}/view?${params.toString()}`,
+          filename: gif.filename,
+          subfolder: gif.subfolder || '',
+        });
+      }
+    }
+  }
+
+  return outputs;
+}
+
+async function saveTask(runtime, task) {
+  if (!runtime.taskStore || typeof runtime.taskStore.put !== 'function') {
+    return;
+  }
+  await runtime.taskStore.put(`${runtime.tasksKvPrefix}:${task.id}`, JSON.stringify(task));
+}
+
+async function loadTask(runtime, taskId) {
+  if (!runtime.taskStore || typeof runtime.taskStore.get !== 'function') {
+    return null;
+  }
+  const raw = await runtime.taskStore.get(`${runtime.tasksKvPrefix}:${taskId}`);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function buildTaskResponse(task, runtime, requestId) {
+  return createJsonResponse(task, 200, runtime, requestId);
 }
 
 async function handleChatCompletions(request, runtime, requestId) {
@@ -388,11 +595,12 @@ async function handleChatCompletions(request, runtime, requestId) {
   try {
     ensureAuthorized(request, runtime);
     const body = await requireJsonBody(request);
-    const isWebUI = body.is_web_ui === true;
-    const prompt = extractPromptFromMessages(body.messages);
-    const model = ensureAllowedModel(body.model, runtime);
-    const imageUrl = await performUpstreamGeneration(prompt, model, '1:1', logger, runtime);
-    const respContent = `![Generated Image](${imageUrl})`;
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const capability = inferCapabilityFromMessages(messages);
+    const prompt = extractPromptFromMessages(messages);
+    const images = capability === 'vision' ? extractImagesFromMessages(messages).map(stripDataUrlPrefix) : [];
+    const model = selectModel(capability, body.model, runtime);
+    const result = await callOllamaChat({ capability, model, messages, prompt, images, logger, runtime });
     const respId = `chatcmpl-${crypto.randomUUID()}`;
 
     if (body.stream) {
@@ -402,29 +610,25 @@ async function handleChatCompletions(request, runtime, requestId) {
 
       (async () => {
         try {
-          if (isWebUI && runtime.enableWebUi) {
-            await writer.write(
-              encoder.encode(`data: ${JSON.stringify({ debug: logger.get() })}\n\n`),
-            );
+          if (body.is_web_ui === true && runtime.enableWebUi) {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({ debug: logger.get() })}\n\n`));
           }
 
-          const chunk = {
+          await writer.write(encoder.encode(`data: ${JSON.stringify({
             id: respId,
             object: 'chat.completion.chunk',
             created: Math.floor(Date.now() / 1000),
             model,
-            choices: [{ index: 0, delta: { content: respContent }, finish_reason: null }],
-          };
-          await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            choices: [{ index: 0, delta: { role: 'assistant', content: result.content }, finish_reason: null }],
+          })}\n\n`));
 
-          const endChunk = {
+          await writer.write(encoder.encode(`data: ${JSON.stringify({
             id: respId,
             object: 'chat.completion.chunk',
             created: Math.floor(Date.now() / 1000),
             model,
             choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-          };
-          await writer.write(encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`));
+          })}\n\n`));
           await writer.write(encoder.encode('data: [DONE]\n\n'));
         } finally {
           await writer.close();
@@ -452,10 +656,11 @@ async function handleChatCompletions(request, runtime, requestId) {
         choices: [
           {
             index: 0,
-            message: { role: 'assistant', content: respContent },
+            message: { role: 'assistant', content: result.content },
             finish_reason: 'stop',
           },
         ],
+        usage: result.usage,
       },
       200,
       runtime,
@@ -473,27 +678,43 @@ async function handleImageGenerations(request, runtime, requestId) {
   try {
     ensureAuthorized(request, runtime);
     const body = await requireJsonBody(request);
-    const prompt = String(body.prompt || '').trim();
-    if (!prompt) {
-      throw new HttpError(400, 'invalid_request', 'Prompt is required');
-    }
-
-    const model = ensureAllowedModel(body.model, runtime);
+    const prompt = requirePrompt(body.prompt);
     const aspectRatio = body.aspect_ratio || normalizeAspectRatioFromSize(body.size);
-    const imageUrl = await performUpstreamGeneration(
+
+    const workflow = buildComfyWorkflow('image', runtime, {
       prompt,
-      model,
-      aspectRatio,
-      logger,
-      runtime,
-    );
+      model: body.model || '',
+      aspect_ratio: aspectRatio,
+      size: body.size || '',
+      negative_prompt: body.negative_prompt || '',
+      image_count: body.n || 1,
+    });
+
+    const submission = await submitComfyWorkflow('image', workflow, logger, runtime);
+    const task = {
+      id: submission.promptId,
+      object: 'task',
+      type: 'image',
+      status: 'submitted',
+      upstream: 'comfyui',
+      created_at: new Date().toISOString(),
+      request_id: requestId,
+      prompt,
+      output: [],
+    };
+    await saveTask(runtime, task);
 
     return createJsonResponse(
       {
         created: Math.floor(Date.now() / 1000),
-        data: [{ url: imageUrl }],
+        data: [],
+        task: {
+          id: task.id,
+          status: task.status,
+          poll_url: `/v1/tasks/${encodeURIComponent(task.id)}`,
+        },
       },
-      200,
+      202,
       runtime,
       requestId,
     );
@@ -503,21 +724,115 @@ async function handleImageGenerations(request, runtime, requestId) {
   }
 }
 
+async function handleVideoGenerations(request, runtime, requestId) {
+  const logger = new Logger(requestId);
+
+  try {
+    ensureAuthorized(request, runtime);
+    const body = await requireJsonBody(request);
+    const prompt = requirePrompt(body.prompt);
+
+    const workflow = buildComfyWorkflow('video', runtime, {
+      prompt,
+      model: body.model || '',
+      duration: body.duration || '',
+      aspect_ratio: body.aspect_ratio || '',
+      size: body.size || '',
+      negative_prompt: body.negative_prompt || '',
+      reference_image: body.reference_image || '',
+    });
+
+    const submission = await submitComfyWorkflow('video', workflow, logger, runtime);
+    const task = {
+      id: submission.promptId,
+      object: 'task',
+      type: 'video',
+      status: 'submitted',
+      upstream: 'comfyui',
+      created_at: new Date().toISOString(),
+      request_id: requestId,
+      prompt,
+      output: [],
+    };
+    await saveTask(runtime, task);
+
+    return createJsonResponse(
+      {
+        created: Math.floor(Date.now() / 1000),
+        task: {
+          id: task.id,
+          status: task.status,
+          poll_url: `/v1/tasks/${encodeURIComponent(task.id)}`,
+        },
+      },
+      202,
+      runtime,
+      requestId,
+    );
+  } catch (error) {
+    logger.add('Fatal Error', error?.message || String(error));
+    return handleError(error, runtime, requestId);
+  }
+}
+
+async function handleTaskLookup(request, runtime, requestId, taskId) {
+  const logger = new Logger(requestId);
+
+  try {
+    ensureAuthorized(request, runtime);
+
+    const stored = await loadTask(runtime, taskId);
+    const type = stored?.type || 'unknown';
+    const history = await fetchComfyHistory(taskId, logger, runtime);
+    const outputs = extractComfyOutputs(history, taskId, runtime);
+
+    let status = 'running';
+    if (outputs.length > 0) {
+      status = 'completed';
+    } else if (history?.[taskId]?.status?.status_str) {
+      const rawStatus = String(history[taskId].status.status_str).toLowerCase();
+      if (rawStatus.includes('error')) status = 'failed';
+      else if (rawStatus.includes('success')) status = 'completed';
+      else if (rawStatus.includes('queue')) status = 'queued';
+    } else if (stored) {
+      status = stored.status;
+    }
+
+    const task = {
+      id: taskId,
+      object: 'task',
+      type,
+      status,
+      upstream: 'comfyui',
+      created_at: stored?.created_at || null,
+      updated_at: new Date().toISOString(),
+      output: outputs,
+    };
+
+    await saveTask(runtime, task);
+    return buildTaskResponse(task, runtime, requestId);
+  } catch (error) {
+    logger.add('Fatal Error', error?.message || String(error));
+    return handleError(error, runtime, requestId);
+  }
+}
+
 function handleModelsRequest(runtime, requestId) {
-  return createJsonResponse(
-    {
-      object: 'list',
-      data: runtime.allowedModels.map((id) => ({
-        id,
-        object: 'model',
-        created: Date.now(),
-        owned_by: runtime.projectName,
-      })),
-    },
-    200,
-    runtime,
-    requestId,
-  );
+  const textModels = runtime.textModelAllowlist.length > 0
+    ? runtime.textModelAllowlist
+    : runtime.defaultTextModel ? [runtime.defaultTextModel] : [];
+  const visionModels = runtime.visionModelAllowlist.length > 0
+    ? runtime.visionModelAllowlist
+    : runtime.defaultVisionModel ? [runtime.defaultVisionModel] : [];
+
+  const models = [
+    ...textModels.map((id) => ({ id, object: 'model', created: Date.now(), owned_by: 'ollama', capability: 'text' })),
+    ...visionModels.map((id) => ({ id, object: 'model', created: Date.now(), owned_by: 'ollama', capability: 'vision' })),
+    { id: 'comfyui-image', object: 'model', created: Date.now(), owned_by: 'comfyui', capability: 'image' },
+    { id: 'comfyui-video', object: 'model', created: Date.now(), owned_by: 'comfyui', capability: 'video' },
+  ];
+
+  return createJsonResponse({ object: 'list', data: models }, 200, runtime, requestId);
 }
 
 function handleError(error, runtime, requestId) {
@@ -580,223 +895,42 @@ function corsHeaders(headers = {}, runtime) {
   };
 }
 
-class HttpError extends Error {
-  constructor(status, code, message) {
-    super(message);
-    this.name = 'HttpError';
-    this.status = status;
-    this.code = code;
-  }
-}
-
 function handleUI(request, runtime, requestId) {
   const origin = new URL(request.url).origin;
-  const apiKeyHint = runtime.apiMasterKey ? maskSecret(runtime.apiMasterKey) : '(missing)';
-
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${runtime.projectName} - 控制台</title>
+  <title>${runtime.projectName}</title>
   <style>
-    :root { --bg: #09090b; --panel: #18181b; --border: #27272a; --text: #e4e4e7; --primary: #f59e0b; --accent: #3b82f6; --code-bg: #000000; }
-    body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); margin: 0; min-height: 100vh; display: flex; overflow: hidden; }
-    .sidebar { width: 360px; background: var(--panel); border-right: 1px solid var(--border); padding: 24px; display: flex; flex-direction: column; overflow-y: auto; }
-    .main { flex: 1; display: flex; flex-direction: column; padding: 24px; background-color: #000; }
-    h2 { margin-top: 0; font-size: 20px; color: #fff; display: flex; align-items: center; gap: 10px; }
-    .badge { background: var(--primary); color: #000; font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
-    .box { background: #27272a; padding: 16px; border-radius: 8px; border: 1px solid #3f3f46; margin-bottom: 20px; }
-    .label { font-size: 12px; color: #a1a1aa; margin-bottom: 8px; display: block; font-weight: 600; }
-    .code-block { font-family: 'Consolas', monospace; font-size: 12px; color: var(--primary); background: #111; padding: 10px; border-radius: 6px; word-break: break-all; border: 1px solid #333; }
-    input, select, textarea { width: 100%; background: #18181b; border: 1px solid #3f3f46; color: #fff; padding: 10px; border-radius: 6px; margin-bottom: 12px; box-sizing: border-box; font-family: inherit; }
-    button { width: 100%; padding: 12px; background: var(--primary); border: none; border-radius: 6px; font-weight: bold; cursor: pointer; color: #000; font-size: 14px; }
-    button:disabled { background: #3f3f46; color: #71717a; cursor: not-allowed; }
-    .result-area { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative; background: radial-gradient(circle at center, #1a1a1a 0%, #000 100%); border-radius: 12px; border: 1px solid var(--border); }
-    .result-img { max-width: 95%; max-height: 95%; border-radius: 8px; box-shadow: 0 0 30px rgba(0,0,0,0.7); }
-    .status-bar { min-height: 30px; display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: #71717a; margin-top: 12px; padding: 0 4px; }
-    .spinner { width: 24px; height: 24px; border: 3px solid #333; border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite; display: none; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .log-panel { height: 220px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow-y: auto; font-family: 'Consolas', monospace; font-size: 11px; color: #a1a1aa; margin-top: 10px; }
-    .log-entry { margin-bottom: 8px; border-bottom: 1px solid #1a1a1a; padding-bottom: 8px; }
-    .log-time { color: #52525b; margin-right: 8px; }
-    .log-key { color: var(--accent); font-weight: bold; margin-right: 8px; }
-    .log-json { color: #86efac; white-space: pre-wrap; display: block; margin-top: 4px; padding-left: 10px; border-left: 2px solid #333; }
+    body { font-family: system-ui, sans-serif; background: #09090b; color: #e4e4e7; margin: 0; padding: 32px; }
+    .card { max-width: 900px; margin: 0 auto; background: #18181b; border: 1px solid #27272a; border-radius: 16px; padding: 24px; }
+    code, pre { background: #111; color: #f59e0b; padding: 2px 6px; border-radius: 6px; }
+    pre { padding: 16px; overflow: auto; }
+    h1, h2 { margin-top: 0; }
   </style>
 </head>
 <body>
-  <div class="sidebar">
-    <h2>🎨 Gateway Console <span class="badge">${runtime.projectVersion}</span></h2>
-    <div class="box">
-      <span class="label">Request ID</span>
-      <div class="code-block">${requestId}</div>
-    </div>
-    <div class="box">
-      <span class="label">API 密钥（掩码显示）</span>
-      <div class="code-block">${apiKeyHint}</div>
-    </div>
-    <div class="box">
-      <span class="label">API 地址</span>
-      <div class="code-block">${origin}/v1/chat/completions</div>
-    </div>
-    <div class="box">
-      <span class="label">模型 (Model)</span>
-      <select id="model">
-        ${runtime.allowedModels
-          .map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`)
-          .join('')}
-      </select>
-      <span class="label">比例 (Aspect Ratio)</span>
-      <select id="ratio">
-        <option value="1:1">1:1 (方形)</option>
-        <option value="16:9">16:9 (横屏)</option>
-        <option value="9:16">9:16 (竖屏)</option>
-      </select>
-      <span class="label">提示词 (Prompt)</span>
-      <textarea id="prompt" rows="6" placeholder="描述你想生成的图片..."></textarea>
-      <button id="btn-gen" onclick="generate()">🚀 开始生成</button>
-    </div>
+  <div class="card">
+    <h1>AI Gateway Console</h1>
+    <p>Request ID: <code>${escapeHtml(requestId)}</code></p>
+    <p>Capabilities: <code>text</code> <code>vision</code> <code>image</code> <code>video</code></p>
+    <h2>Endpoints</h2>
+    <pre>${escapeHtml(`${origin}/health
+${origin}/v1/models
+${origin}/v1/chat/completions
+${origin}/v1/images/generations
+${origin}/v1/videos/generations
+${origin}/v1/tasks/:id`)}</pre>
+    <h2>Upstreams</h2>
+    <pre>${escapeHtml(JSON.stringify({
+      ollama: runtime.ollamaBaseUrl,
+      comfyui: runtime.comfyuiBaseUrl,
+      textModels: runtime.textModelAllowlist,
+      visionModels: runtime.visionModelAllowlist,
+    }, null, 2))}</pre>
   </div>
-  <main class="main">
-    <div class="result-area" id="result-container">
-      <div style="color:#3f3f46; text-align:center;">
-        <p>图片预览区域</p>
-        <div class="spinner" id="spinner"></div>
-      </div>
-    </div>
-    <div class="status-bar">
-      <span id="status-text">系统就绪</span>
-      <span id="time-text"></span>
-    </div>
-    <div class="log-panel" id="logs">
-      <div style="color:#52525b">// 等待请求... 日志将显示在这里</div>
-    </div>
-  </main>
-  <script>
-    const ENDPOINT = ${JSON.stringify(`${origin}/v1/chat/completions`)};
-    const API_KEY = prompt('请输入 API 密钥以测试当前 Worker');
-
-    function appendLog(step, data) {
-      const logs = document.getElementById('logs');
-      const div = document.createElement('div');
-      div.className = 'log-entry';
-      const time = new Date().toLocaleTimeString();
-      const content = typeof data === 'object'
-        ? `<span class="log-json">${escapeForHtml(JSON.stringify(data, null, 2))}</span>`
-        : `<span style="color:#e4e4e7">${escapeForHtml(String(data))}</span>`;
-      div.innerHTML = `<span class="log-time">[${time}]</span><span class="log-key">${escapeForHtml(step)}</span>${content}`;
-      if (logs.innerText.includes('// 等待请求')) logs.innerHTML = '';
-      logs.appendChild(div);
-      logs.scrollTop = logs.scrollHeight;
-    }
-
-    function escapeForHtml(text) {
-      return text
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;')
-        .replaceAll("'", '&#39;');
-    }
-
-    async function generate() {
-      if (!API_KEY) {
-        alert('没有输入 API 密钥，无法测试。');
-        return;
-      }
-
-      const promptEl = document.getElementById('prompt');
-      const prompt = promptEl ? promptEl.value.trim() : '';
-      if (!prompt) return alert('请输入提示词');
-
-      const btn = document.getElementById('btn-gen');
-      const spinner = document.getElementById('spinner');
-      const status = document.getElementById('status-text');
-      const container = document.getElementById('result-container');
-      const logs = document.getElementById('logs');
-      const timeText = document.getElementById('time-text');
-      const model = document.getElementById('model').value;
-      const ratio = document.getElementById('ratio').value;
-
-      if (btn) { btn.disabled = true; btn.innerText = '生成中...'; }
-      if (spinner) spinner.style.display = 'inline-block';
-      if (status) status.innerText = '正在连接上游 API...';
-      if (container) container.innerHTML = '<div class="spinner" style="display:block"></div>';
-      if (logs) logs.innerHTML = '';
-
-      const startTime = Date.now();
-
-      try {
-        const payload = {
-          model,
-          messages: [{ role: 'user', content: prompt }],
-          stream: true,
-          is_web_ui: true,
-          aspect_ratio: ratio,
-        };
-
-        appendLog('System', 'Initiating request to Worker...');
-        const res = await fetch(ENDPOINT, {
-          method: 'POST',
-          headers: {
-            Authorization: 'Bearer ' + API_KEY,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(payload),
-        });
-
-        if (!res.ok) {
-          const errData = await res.json();
-          throw new Error(errData.error?.message || `HTTP ${res.status}`);
-        }
-
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let fullContent = '';
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = decoder.decode(value);
-          const lines = chunk.split('\n');
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-            const jsonStr = line.slice(6);
-            if (jsonStr === '[DONE]') break;
-            try {
-              const json = JSON.parse(jsonStr);
-              if (json.debug) {
-                json.debug.forEach(log => appendLog(log.step, log.data));
-                continue;
-              }
-              if (json.choices && json.choices[0]?.delta?.content) {
-                fullContent += json.choices[0].delta.content;
-              }
-            } catch (error) {
-              appendLog('Parse Warning', String(error));
-            }
-          }
-        }
-
-        const match = fullContent.match(/\((.*?)\)/);
-        if (match && match[1]) {
-          const imgUrl = match[1];
-          if (container) container.innerHTML = `<img src="${imgUrl}" class="result-img">`;
-          if (status) status.innerText = '生成成功';
-          if (timeText) timeText.innerText = `耗时: ${((Date.now() - startTime) / 1000).toFixed(2)}s`;
-          appendLog('Success', 'Image URL extracted: ' + imgUrl);
-        } else {
-          throw new Error('无法从响应中提取图片 URL');
-        }
-      } catch (error) {
-        if (container) container.innerHTML = `<div style="color:#ef4444; padding:20px; text-align:center">❌ ${escapeForHtml(String(error.message || error))}</div>`;
-        if (status) status.innerText = '发生错误';
-        appendLog('Error', error.message || String(error));
-      } finally {
-        if (btn) { btn.disabled = false; btn.innerText = '🚀 开始生成'; }
-      }
-    }
-  </script>
 </body>
 </html>`;
 
@@ -806,12 +940,6 @@ function handleUI(request, runtime, requestId) {
       'X-Request-Id': requestId,
     },
   });
-}
-
-function maskSecret(value) {
-  if (!value) return '(missing)';
-  if (value.length <= 8) return `${value.slice(0, 1)}***${value.slice(-1)}`;
-  return `${value.slice(0, 4)}***${value.slice(-4)}`;
 }
 
 function escapeHtml(value) {
