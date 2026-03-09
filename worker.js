@@ -312,8 +312,7 @@ async function fetchWithTimeout(url, init, timeoutMs) {
   }
 }
 
-async function callOllamaChat({ capability, model, messages, prompt, images, logger, runtime }) {
-  const endpoint = `${runtime.ollamaBaseUrl}/api/chat`;
+function buildOllamaChatPayload({ capability, model, messages, prompt, images, stream = false }) {
   const ollamaMessages = Array.isArray(messages) && messages.length > 0
     ? messages.map((message) => normalizeOllamaMessage(message))
     : [{ role: 'user', content: prompt, ...(images?.length ? { images } : {}) }];
@@ -329,11 +328,16 @@ async function callOllamaChat({ capability, model, messages, prompt, images, log
     }
   }
 
-  const payload = {
+  return {
     model,
     messages: ollamaMessages,
-    stream: false,
+    stream,
   };
+}
+
+async function callOllamaChat({ capability, model, messages, prompt, images, logger, runtime }) {
+  const endpoint = `${runtime.ollamaBaseUrl}/api/chat`;
+  const payload = buildOllamaChatPayload({ capability, model, messages, prompt, images, stream: false });
 
   logger.add('Ollama Request', { endpoint, capability, model, payload });
   const response = await fetchWithTimeout(
@@ -362,6 +366,97 @@ async function callOllamaChat({ capability, model, messages, prompt, images, log
     content: stripThinkTags(content),
     usage: buildOllamaUsage(data),
   };
+}
+
+async function callOllamaChatStream({ capability, model, messages, prompt, images, logger, runtime, onDelta }) {
+  const endpoint = `${runtime.ollamaBaseUrl}/api/chat`;
+  const payload = buildOllamaChatPayload({ capability, model, messages, prompt, images, stream: true });
+
+  logger.add('Ollama Stream Request', { endpoint, capability, model, payload });
+  const response = await fetchWithTimeout(
+    endpoint,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    runtime.upstreamTimeoutMs,
+  );
+
+  if (!response.ok) {
+    const data = await safeReadJson(response);
+    logger.add('Ollama Stream Error', { status: response.status, data });
+    throw new HttpError(502, 'upstream_error', `Ollama error (${response.status}): ${JSON.stringify(data)}`);
+  }
+
+  if (!response.body) {
+    throw new HttpError(502, 'upstream_invalid_response', 'Ollama stream response missing body');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let usage = {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      let data;
+      try {
+        data = JSON.parse(line);
+      } catch {
+        logger.add('Ollama Stream Parse Skip', { line });
+        continue;
+      }
+
+      if (data?.error) {
+        throw new HttpError(502, 'upstream_error', `Ollama stream error: ${data.error}`);
+      }
+
+      const content = stripThinkTags(data?.message?.content || '');
+      if (content) {
+        await onDelta(content);
+      }
+
+      if (data?.done) {
+        usage = buildOllamaUsage(data);
+      }
+    }
+  }
+
+  if (buffer.trim()) {
+    try {
+      const data = JSON.parse(buffer.trim());
+      if (data?.error) {
+        throw new HttpError(502, 'upstream_error', `Ollama stream error: ${data.error}`);
+      }
+      const content = stripThinkTags(data?.message?.content || '');
+      if (content) {
+        await onDelta(content);
+      }
+      if (data?.done) {
+        usage = buildOllamaUsage(data);
+      }
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      logger.add('Ollama Stream Tail Parse Skip', { buffer: buffer.trim() });
+    }
+  }
+
+  return { usage };
 }
 
 function normalizeOllamaMessage(message) {
@@ -606,7 +701,6 @@ async function handleChatCompletions(request, runtime, requestId) {
     const prompt = extractPromptFromMessages(messages);
     const images = capability === 'vision' ? extractImagesFromMessages(messages).map(stripDataUrlPrefix) : [];
     const model = selectModel(capability, body.model, runtime);
-    const result = await callOllamaChat({ capability, model, messages, prompt, images, logger, runtime });
     const respId = `chatcmpl-${crypto.randomUUID()}`;
 
     if (body.stream) {
@@ -620,13 +714,39 @@ async function handleChatCompletions(request, runtime, requestId) {
             await writer.write(encoder.encode(`data: ${JSON.stringify({ debug: logger.get() })}\n\n`));
           }
 
-          await writer.write(encoder.encode(`data: ${JSON.stringify({
-            id: respId,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
+          let sentRole = false;
+          await callOllamaChatStream({
+            capability,
             model,
-            choices: [{ index: 0, delta: { role: 'assistant', content: result.content }, finish_reason: null }],
-          })}\n\n`));
+            messages,
+            prompt,
+            images,
+            logger,
+            runtime,
+            onDelta: async (content) => {
+              const delta = sentRole
+                ? { content }
+                : { role: 'assistant', content };
+              sentRole = true;
+              await writer.write(encoder.encode(`data: ${JSON.stringify({
+                id: respId,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [{ index: 0, delta, finish_reason: null }],
+              })}\n\n`));
+            },
+          });
+
+          if (!sentRole) {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({
+              id: respId,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model,
+              choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+            })}\n\n`));
+          }
 
           await writer.write(encoder.encode(`data: ${JSON.stringify({
             id: respId,
@@ -636,6 +756,14 @@ async function handleChatCompletions(request, runtime, requestId) {
             choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
           })}\n\n`));
           await writer.write(encoder.encode('data: [DONE]\n\n'));
+        } catch (error) {
+          logger.add('Stream Fatal Error', error?.message || String(error));
+          await writer.write(encoder.encode(`data: ${JSON.stringify({
+            error: {
+              message: error?.message || 'Stream failed',
+              type: error?.code || 'stream_error',
+            },
+          })}\n\n`));
         } finally {
           await writer.close();
         }
@@ -646,12 +774,15 @@ async function handleChatCompletions(request, runtime, requestId) {
           {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
             'X-Request-Id': requestId,
           },
           runtime,
         ),
       });
     }
+
+    const result = await callOllamaChat({ capability, model, messages, prompt, images, logger, runtime });
 
     return createJsonResponse(
       {
