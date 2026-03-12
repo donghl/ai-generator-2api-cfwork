@@ -5,3 +5,7 @@ compatibility_date = "2026-03-12"
 kv_namespaces = [
   { binding = "TASKS", id = "6af3126164fa47ce99d3853a881753c4", preview_id = "79399e870bab4ea6935a5c6125247e24" }
 ]
+
+[vars]
+OLLAMA_BASE_URL = ""
+COMFYUI_BASE_URL = ""
