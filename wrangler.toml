@@ -5,3 +5,17 @@ compatibility_date = "2026-03-12"
 kv_namespaces = [
   { binding = "TASKS", id = "6af3126164fa47ce99d3853a881753c4", preview_id = "79399e870bab4ea6935a5c6125247e24" }
 ]
+
+[vars]
+PROJECT_NAME = "ai-generator-openai-gateway"
+PROJECT_VERSION = "3.1.0"
+ENABLE_WEB_UI = false
+UPSTREAM_TIMEOUT_MS = 60000
+CORS_ALLOW_ORIGIN = "*"
+DEFAULT_TEXT_MODEL = ""
+DEFAULT_VISION_MODEL = ""
+TEXT_MODEL_ALLOWLIST = "[]"
+VISION_MODEL_ALLOWLIST = "[]"
+IMAGE_WORKFLOW_JSON = ""
+VIDEO_WORKFLOW_JSON = ""
+TASKS_KV_PREFIX = "task"
