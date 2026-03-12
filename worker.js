@@ -809,6 +809,23 @@ async function handleChatCompletions(request, runtime, requestId) {
   }
 }
 
+
+function applyWorkflowInputs(workflow, inputs) {
+  // Best-effort injection: replace matching input nodes by key if present.
+  // If your workflow uses a different schema, adjust this mapping.
+  if (!workflow || !workflow.nodes) return workflow;
+  for (const node of workflow.nodes) {
+    if (!node || !node.inputs) continue;
+    for (const [key, value] of Object.entries(inputs)) {
+      if (value === undefined || value === null || value === '') continue;
+      if (key in node.inputs) {
+        node.inputs[key] = value;
+      }
+    }
+  }
+  return workflow;
+}
+
 async function handleImageGenerations(request, runtime, requestId) {
   const logger = new Logger(requestId);
 
@@ -817,15 +834,32 @@ async function handleImageGenerations(request, runtime, requestId) {
     const body = await requireJsonBody(request);
     const prompt = requirePrompt(body.prompt);
     const aspectRatio = body.aspect_ratio || normalizeAspectRatioFromSize(body.size);
-
-    const workflow = buildComfyWorkflow('image', runtime, {
+    const workflowId = body.workflow_id;
+    if (!workflowId || typeof workflowId !== 'string') {
+      throw createHttpError(400, 'workflow_id is required');
+    }
+    const workflowKey = `comfyui/images_json/${workflowId}.json`;
+    const workflowObject = await runtime.R2.get(workflowKey);
+    if (!workflowObject) {
+      throw createHttpError(404, `workflow not found: ${workflowId}`);
+    }
+    const workflowText = await workflowObject.text();
+    let workflow;
+    try {
+      workflow = JSON.parse(workflowText);
+    } catch (e) {
+      throw createHttpError(500, `invalid workflow json: ${workflowId}`);
+    }
+    // inject dynamic params if needed
+    workflow = applyWorkflowInputs(workflow, {
       prompt,
-      model: body.model || '',
+      negative_prompt: body.negative_prompt || '',
       aspect_ratio: aspectRatio,
       size: body.size || '',
-      negative_prompt: body.negative_prompt || '',
       image_count: body.n || 1,
+      ref_image: body.ref_image || '',
     });
+
 
     const submission = await submitComfyWorkflow('image', workflow, logger, runtime);
     const task = {
