@@ -7,15 +7,15 @@ kv_namespaces = [
 ]
 
 [vars]
-OLLAMA_BASE_URL = "https://honglei.synology.me:11434"
-COMFYUI_BASE_URL = "https://honglei.synology.me:8188"
+OLLAMA_BASE_URL = ""
+COMFYUI_BASE_URL = ""
 VIDEO_WORKFLOW_JSON = """"""
 DEFAULT_TEXT_MODEL = "qwen3.5:latest"
 DEFAULT_VISION_MODEL = "qwen3-vl:latest"
 TEXT_MODEL_ALLOWLIST = "[\"qwen3.5:latest\",\"qwen3:latest\"]"
 VISION_MODEL_ALLOWLIST = "[]"
 PROJECT_NAME = "ai-generator-openai-gateway"
-PROJECT_VERSION = "3.1.0"
+PROJECT_VERSION = "3.2.0"
 ENABLE_WEB_UI = false
 UPSTREAM_TIMEOUT_MS = 60000
 CORS_ALLOW_ORIGIN = "*"

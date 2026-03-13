@@ -11,8 +11,8 @@ const CONFIG = {
   ENABLE_WEB_UI: false,
   UPSTREAM_TIMEOUT_MS: 60000,
   CORS_ALLOW_ORIGIN: '*',
-  OLLAMA_BASE_URL: 'https://honglei.synology.me:11434',
-  COMFYUI_BASE_URL: 'https://honglei.synology.me:8188',
+  OLLAMA_BASE_URL: '',
+  COMFYUI_BASE_URL: '',
   DEFAULT_TEXT_MODEL: '',
   DEFAULT_VISION_MODEL: '',
   TEXT_MODEL_ALLOWLIST: [],
@@ -1135,11 +1135,11 @@ ${origin}/v1/videos/generations
 ${origin}/v1/tasks/:id`)}</pre>
     <h2>Upstreams</h2>
     <pre>${escapeHtml(JSON.stringify({
-      ollama: runtime.ollamaBaseUrl,
-      comfyui: runtime.comfyuiBaseUrl,
-      textModels: runtime.textModelAllowlist,
-      visionModels: runtime.visionModelAllowlist,
-    }, null, 2))}</pre>
+    ollama: runtime.ollamaBaseUrl,
+    comfyui: runtime.comfyuiBaseUrl,
+    textModels: runtime.textModelAllowlist,
+    visionModels: runtime.visionModelAllowlist,
+  }, null, 2))}</pre>
   </div>
 </body>
 </html>`;
